@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+# 使用 uv add/remove 管理依赖，uv sync 同步环境，uv run 执行项目命令。
+name = "cqyc-askme"
+version = "0.1.0"
+description = "面向招聘 HR 和 Agent 开发者的个人 RAG 知识库问答系统"
+readme = "README.md"
+requires-python = ">=3.11,<3.14"
+dependencies = [
+    "fastapi",
+    "uvicorn[standard]",
+    "pydantic-settings",
+    "redis>=8.1.0",
+    "pypdf>=6.21.1",
+    "python-multipart>=0.0.32",
+]
+
+# 集成依赖先声明为可选项；骨架启动无需安装它们或连接外部服务。
+[project.optional-dependencies]
+rag = [
+    "langchain",
+    "langgraph",
+    "langchain-deepseek",
+    "pymilvus",
+    "minio>=7.2.20",
+    "httpx>=0.28.1",
+    "markdown-it-py>=4.2.0",
+    "tokenizers>=0.23.3",
+    "huggingface-hub>=2.2.0",
+    "pillow>=13.0.0",
+    "langchain-text-splitters>=1.1.3",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
