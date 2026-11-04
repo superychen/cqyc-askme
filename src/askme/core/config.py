@@ -61,6 +61,25 @@ class Settings(BaseSettings):
     chunk_min_size: int = Field(180, ge=1)
     chunk_max_size: int = Field(1000, le=8000)
     chunk_overlap: int = Field(80, ge=0)
+    # 公开问答配置与管理员会话分离：IP 密钥轮换会改变匿名身份，不能随登录密钥更换。
+    # 演示：历史 30 天到期后，永久 ledger 中 used=20 仍保留，不再次发放额度。
+    ip_id_secret: SecretStr = SecretStr("")
+    chat_allowed_origins: str = "http://localhost:5174,http://127.0.0.1:5174"
+    chat_history_ttl: int = Field(2592000, ge=3600)
+    chat_timeout: int = Field(120, ge=30, le=300)
+    chat_prompt_budget: int = Field(24000, ge=18000)
+    chat_output_tokens: int = Field(1200, ge=128, le=1200)
+    rag_top_k: int = Field(20, ge=1, le=50)
+    answer_context_top_k: int = Field(6, ge=1, le=10)
+    rerank_base_url: str = ""
+    rerank_api_key: SecretStr = SecretStr("")
+    rerank_model: str = "BAAI/bge-reranker-v2-m3"
+    rerank_min_score: float = Field(0.5, ge=0, le=1)
+    bailian_search_mcp_url: str = ""
+    bailian_search_tool_name: str = ""
+    dashscope_api_key: SecretStr = SecretStr("")
+    # 默认零预算：部署者核对百炼计费后填写，不能因上线代码自动产生搜索费用。
+    web_search_budget: int = Field(0, ge=0)
 
     @model_validator(mode="after")
     def validate_limits(self) -> "Settings":

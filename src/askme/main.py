@@ -1,7 +1,9 @@
-"""FastAPI 应用入口；当前只提供进程存活检查。"""
+"""FastAPI 生命周期：共享 Redis → 管理导入/公开聊天路由 → 停止任务后释放连接。"""
 
 import logging
 import uuid
+import asyncio
+import contextlib
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
@@ -14,6 +16,7 @@ from askme.api.router import api_router
 from askme.core.config import get_settings
 from askme.core.errors import AppError, error_location
 from askme.core.body_limit import BodyLimitMiddleware
+from askme.services.chat_service import ChatService
 
 logger = logging.getLogger(__name__)
 
@@ -34,9 +37,16 @@ async def lifespan(app: FastAPI):
         logger.warning("Admin configuration missing fields=%s", ",".join(missing))
     app.state.redis = Redis.from_url(settings.redis_url.get_secret_value(), decode_responses=True,
         socket_connect_timeout=3, socket_timeout=10)
+    # 聊天图延迟构建；回收器不调用模型。演示 API 崩溃留下的失效租约会自动回收。
+    app.state.chat = ChatService(settings, app.state.redis)
+    recovery = asyncio.create_task(app.state.chat.sweep())
     try:
         yield
     finally:
+        recovery.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await recovery
+        await app.state.chat.close()
         await app.state.redis.aclose()
         logger.info("Application stopped app=%s", settings.app_name)
 
@@ -57,7 +67,7 @@ def create_app() -> FastAPI:
             response = await call_next(request)
         response.headers["X-Request-ID"] = request.state.request_id
         response.headers["X-Content-Type-Options"] = "nosniff"
-        if request.url.path.startswith("/api/v1/admin"):
+        if request.url.path.startswith(("/api/v1/admin", "/api/v1/chat")):
             response.headers["Cache-Control"] = "no-store"
         return response
 

@@ -1,0 +1,120 @@
+# 从项目根目录执行：docker compose -f deploy/mineru/compose.yaml up -d
+# 请求链路：项目 Worker -> 本机 8001 -> mineru-api -> 内网 mineru-vlm:30000。
+# API 的 ONNX 小模型使用 CPU；只有 VLM 使用 GPU，避免与 BGE-M3 重复抢占显存。
+name: askme-mineru
+
+x-runtime: &runtime
+  image: askme/mineru:4.0.12-llamacuda-b11669
+  restart: unless-stopped
+  # 该相对目录位于 D 盘；模型、下载缓存和任务产物不会写入容器可写层。
+  volumes:
+    - ./runtime:/var/lib/mineru
+  logging:
+    driver: json-file
+    options:
+      max-size: "10m"
+      max-file: "3"
+
+services:
+  mineru-vlm:
+    <<: *runtime
+    container_name: askme-mineru-vlm
+    build:
+      context: .
+    shm_size: "1gb"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["0"]
+              capabilities: [gpu]
+    environment:
+      NVIDIA_VISIBLE_DEVICES: "0"
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility
+      # 这些是官方发布包中经过 SHA256 校验的 CUDA 库和 llama.cpp 程序。
+      LD_LIBRARY_PATH: /var/lib/mineru/cuda:/var/lib/mineru/llama:/usr/local/nvidia/lib64
+      OMP_NUM_THREADS: "4"
+    entrypoint: ["/var/lib/mineru/llama/llama-server"]
+    command:
+      - --model
+      - /var/lib/mineru/models/MinerU2.5-Pro-2605-1.2B-GGUF/MinerU2.5-Pro-2605-1.2B-Q8_0.gguf
+      - --mmproj
+      - /var/lib/mineru/models/MinerU2.5-Pro-2605-1.2B-GGUF/mmproj-MinerU2.5-Pro-2605-1.2B-Q8_0.gguf
+      - --alias
+      - MinerU2.5-Pro-2605-1.2B-GGUF
+      - --host
+      - 0.0.0.0
+      - --port
+      - "30000"
+      # Q8_0 权重 + 单个 8192-token 槽位限制常驻内存，不按整张显卡预留缓存。
+      # 这不是显存硬隔离；后续调大上下文或并发前必须重新观察 GPU 峰值。
+      - --ctx-size
+      - "8192"
+      - --parallel
+      - "1"
+      - --n-gpu-layers
+      - "99"
+      - --batch-size
+      - "512"
+      - --ubatch-size
+      - "256"
+      - --threads
+      - "4"
+      - --no-kv-unified
+      - --cache-ram
+      - "0"
+      # 对齐 MinerU 官方 llama-server 包装器：保留版面坐标等特殊 token，
+      # 并约束有效 Unicode；否则 HTTP 成功也可能得到无法解析的版面输出。
+      - --special
+      - --grammar
+      - "root ::= .*"
+    # VLM 仅在 Compose 网络内访问，不占用宿主机端口。
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:30000/health', timeout=5)"]
+      interval: 15s
+      timeout: 8s
+      retries: 5
+      start_period: 300s
+
+  mineru-api:
+    <<: *runtime
+    container_name: askme-mineru
+    depends_on:
+      mineru-vlm:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:8001:8000"
+    environment:
+      # API 容器不申请 GPU；布局、OCR 和表格小模型明确在 CPU 上执行。
+      CUDA_VISIBLE_DEVICES: ""
+      MINERU_TABLE_DEVICE: cpu
+      MINERU_MODEL_VLM_SERVER_URL: http://mineru-vlm:30000
+      MINERU_MODEL_VLM_MAX_CONCURRENCY: "1"
+      MINERU_INTRA_OP_NUM_THREADS: "4"
+      MINERU_INTER_OP_NUM_THREADS: "1"
+      MINERU_PDF_RENDER_THREADS: "2"
+      MINERU_PROCESSING_WINDOW_SIZE: "4"
+      OMP_NUM_THREADS: "4"
+    command:
+      - api-server
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8000"
+      - --tier
+      - standard
+      # 单个 PDF 在执行时，后续 PDF 排队；单文档内部也只发起 1 个 VLM 请求。
+      - --concurrency
+      - "1"
+      - --vlm-max-concurrency
+      - "1"
+      - --upload-dir
+      - /var/lib/mineru/uploads
+      - --preload-models
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/v1/health', timeout=5)"]
+      interval: 20s
+      timeout: 8s
+      retries: 5
+      start_period: 180s

@@ -57,6 +57,15 @@ async def sign_out(request: Request, response: Response, _: dict = Depends(requi
 
 
 def validate_file(path: Path, suffix: str) -> None:
+    """校验 upload 已限量落盘的文件；成功返回 None，失败抛出 422 AppError。
+
+    path 是内部 source.md/source.pdf 路径，suffix 是入口允许的规范小写后缀。
+    MD 必须为非空 UTF-8（允许 BOM），普通文本同样有效；PDF 必须有文件头、
+    能被解析、未加密且页数在 1 到 PDF_MAX_PAGES 之间，避免无效任务占用 MinerU。
+    演示数据：'# 示例' 的 .md 或一页未加密 PDF 通过；二进制 .md、伪造 PDF、
+    加密 PDF、超页数 PDF 分别返回明确错误，不会进入任务队列。
+    本函数由 asyncio.to_thread 调用，不阻塞 API 事件循环；不调用外部模型。
+    """
     if suffix == ".md":
         try:
             text = path.read_text(encoding="utf-8-sig")
@@ -81,12 +90,36 @@ def validate_file(path: Path, suffix: str) -> None:
         raise AppError("INVALID_PDF", "PDF 文件损坏或无法读取", 422) from None
 
 
-@router.post("/imports")
+@router.post("/imports", summary="上传 PDF 或 UTF-8 Markdown 文档")
 async def upload(request: Request, file: UploadFile = File(...), _: dict = Depends(require_admin)):
-    settings, tasks = get_settings(), store(request)
+    """接收一个 PDF 或 Markdown 文件，校验后创建或复用导入任务。
+
+    入口先由 require_admin 校验管理员与 CSRF；file 是 multipart 的文件字段，
+    filename 只用于检查后缀和展示，保存名固定为 source.md/source.pdf，避免路径穿越。
+    接受大小写不敏感的 .md/.pdf，正文交给 validate_file 按类型校验；
+    不依赖客户端 MIME，因为合法文件也可能被浏览器标为 application/octet-stream。
+    正常返回任务 JSON：新任务/处理中任务为 202，复用已结束任务为 200；
+    reused 表示是否复用了相同文件、后缀与处理配置对应的任务。
+
+    调用顺序：后缀校验 → 限量落盘及 SHA256 → validate_file → Redis 去重锁
+    → TaskStore.new/save 入队 → Worker.execute → ImportPipeline.run 的
+    对应分支：MD 进入 load_markdown，跳过 MinerU 和图片摘要；PDF 进入
+    pdf_to_markdown → MinerU.parse，再存储图片、生成摘要和增强正文，最后分块入库。
+    演示数据：notes.MD 内容为 '# 示例\n正文'，会保存成 source.md 并入队；
+    一页合法 notes.PDF 保存成 source.pdf 并入队；notes.txt 在落盘前返回 415；
+    伪造或加密 PDF、空文件返回 422，
+    超出 UPLOAD_MAX_BYTES 返回 413，非法编码返回 422，不生成可执行任务。
+    失败时关闭上传流、按锁归属解锁并清理未接收的目录；已经写入恢复清单的
+    任务保留磁盘数据，以便 Redis 入队中断后对账，不能误删已接收文件。
+    """
     suffix = Path(file.filename or "").suffix.lower()
-    if suffix not in {".pdf", ".md"}:
-        raise AppError("UNSUPPORTED_FILE", "只支持 PDF 和 Markdown 文件", 415)
+    # API 是最终格式边界，前端 accept 不能替代这里的检查。
+    # 演示：notes.md.pdf 按 PDF 校验真实内容；notes.pdf.exe 在落盘前拒绝。
+    if suffix not in {".md", ".pdf"}:
+        await file.close()
+        logger.warning("Import upload rejected code=UNSUPPORTED_FILE")
+        raise AppError("UNSUPPORTED_FILE", "仅支持 PDF（.pdf）或 UTF-8 编码的 Markdown（.md）文件", 415)
+    settings, tasks = get_settings(), store(request)
     task_id = uuid.uuid4().hex
     folder = tasks.folder(task_id)
     folder.mkdir(parents=True, exist_ok=True)
@@ -94,6 +127,8 @@ async def upload(request: Request, file: UploadFile = File(...), _: dict = Depen
     digest, size, accepted = hashlib.sha256(), 0, False
     lock_key, lock_token = "", uuid.uuid4().hex
     try:
+        # 每次只读取 1 MiB；while 中的 := 保存本次字节块，读到空字节即结束。
+        # 哈希按原始字节计算，例如带 BOM 与不带 BOM 的 MD 是不同上传内容。
         with path.open("wb") as output:
             while block := await file.read(1024 * 1024):
                 size += len(block)
@@ -105,16 +140,20 @@ async def upload(request: Request, file: UploadFile = File(...), _: dict = Depen
             os.fsync(output.fileno())
         if not size:
             raise AppError("EMPTY_FILE", "不能上传空文件", 422)
+        # 文本读取或 PDF 解析放入线程，避免阻塞异步 API；失败时进入 finally 清理。
         await asyncio.to_thread(validate_file, path, suffix)
         dedup_key = f"askme:dedup:{digest.hexdigest()}:{suffix}:{fingerprint(settings)}"
         lock_key = f"{dedup_key}:lock"
+        # 同一内容只允许一个提交者登记；锁的 60 秒有效期用于异常退出后恢复。
         if not await tasks.redis.set(lock_key, lock_token, nx=True, ex=60):
             raise AppError("IMPORT_BUSY", "相同文件正在提交，请稍后刷新任务列表", 409, True)
         existing = await tasks.redis.get(dedup_key)
         if existing:
+            # 文件已有任务时复用原任务；本次新建的临时目录会在 finally 删除。
             previous = await tasks.get(existing)
             if previous["status"] == "queued" and not previous.get("event_id"):
                 await tasks.save(previous, "恢复尚未确认入队的任务", enqueue=True)
+            logger.info("Import reused task_id=%s", previous["task_id"])
             return JSONResponse({**previous, "reused": True}, status_code=202 if previous["status"] in {"queued", "running"} else 200)
         filename = Path((file.filename or "document").replace("\\", "/")).name[:160]
         filename = re.sub(r"[\x00-\x1f\x7f]", "", filename)
@@ -127,10 +166,15 @@ async def upload(request: Request, file: UploadFile = File(...), _: dict = Depen
         await tasks.save(task, "文件已接收，等待处理", enqueue=True)
         logger.info("Import accepted task_id=%s bytes=%s type=%s", task_id, size, suffix)
         return JSONResponse({**task, "reused": False}, status_code=202)
+    except AppError as exc:
+        # 只记录任务 ID 与受控错误码，不记录原文件名、正文或上传内容。
+        logger.warning("Import upload rejected task_id=%s code=%s", task_id, exc.code)
+        raise
     finally:
         await file.close()
         if lock_key:
             try:
+                # 比较令牌后再删除，不能释放锁过期后由另一个请求取得的新锁。
                 await tasks.redis.eval("if redis.call('GET',KEYS[1])==ARGV[1] then return redis.call('DEL',KEYS[1]) end return 0", 1, lock_key, lock_token)
             except RedisError:
                 logger.warning("Import lock release deferred task_id=%s", task_id)

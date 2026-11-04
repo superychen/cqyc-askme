@@ -2,15 +2,30 @@
 
 ## 1. 实现状态与验证范围
 
-本模块已实现 Vue 管理页面、FastAPI 认证和导入接口、Redis Streams Worker、LangGraph 导入节点、图片增强、BGE-M3 token 分块及向量写入代码。当前没有本地外部服务，不声称已完成真实文档端到端导入验收。
+本模块已实现 Vue 管理页面、FastAPI 认证和导入接口、Redis Streams Worker、LangGraph 导入节点、图片增强、BGE-M3 token 分块及向量写入代码。当前上传入口支持 PDF 和 Markdown；本次格式限制变更的检查不替代真实服务端到端验收。
 
 本次不部署中间件、不下载模型权重、不创建测试用例。模块导入、Python 编译、OpenAPI 生成、前端类型检查和构建可以独立检查。登录成功路径、队列消费、PDF 解析、图片读写和真实入库，需要下述服务在线后验证。
+
+### 1.1 上传 PDF 与 Markdown（2026-10-25）
+
+`POST /api/v1/admin/imports` 的 multipart 文件字段为 `file`，允许最终扩展名 `.pdf`、`.md`（大小写不敏感）。TXT、无扩展名、`.pdf.exe` 等返回 HTTP 415 / `UNSUPPORTED_FILE`，在任务目录创建和 Redis 入队之前拒绝。浏览器选择器和拖拽预检同步支持两种格式。
+
+默认大小上限为 20 MiB，空文件返回 422，超限返回 413。MD 校验非空 UTF-8（允许 BOM）及二进制控制字符；PDF 校验 `%PDF-` 文件头、可读性、加密状态及页数（默认 1–200 页，由 `PDF_MAX_PAGES` 控制）。不依赖客户端 MIME，修改后缀不能绕过内容校验。
+
+演示数据（非真实导入结果）：`notes.MD` 正文为 `# 示例标题`，保存为 `source.md`；一页未加密的 `resume.PDF` 保存为 `source.pdf`，新任务均返回 202。将纯文本命名为 `fake.pdf` 返回 422 / `INVALID_PDF`；加密 PDF 返回 `ENCRYPTED_PDF`，超过页数上限返回 `PDF_PAGE_LIMIT`。拒绝的文件不会进入队列，临时目录会清理。
+
+- MD：上传校验 → Redis 入队 → Worker 校验源文件 → `load_markdown` → 文档整理 → tokenizer 分块 → BGE-M3 向量化 → Milvus 写入与校验。跳过 PDF 解析和图片增强；图片引用只保留文本，不读取本地图片或抓取远程资源。
+- PDF：上传校验 → Redis 入队 → Worker 校验源文件 → `pdf_to_markdown` 调用 `MinerU.parse` → MinIO 图片存储 → 图片摘要 → 正文增强 → 文档整理、分块、向量化和入库。无独立图片时不调用图片存储和摘要服务；解析或外部调用失败仍标记任务失败，不伪装成功。
+
+本机部署保留 API、前端、Worker、Redis、BGE-M3、本地 tokenizer 和 Milvus（包括配套 etcd/MinIO）。PDF 另需启动 MinerU：`docker compose -f deploy/mineru/compose.yaml up -d`，设置 `MINERU_BASE_URL=http://127.0.0.1:8001`；提取到图片时还需应用图片桶和图片摘要配置。NATAPP 仅转发网站入口，Worker 直接访问本机 MinerU，不需要额外公开解析端口。
+
+更新后重启 API；前端开发服务读取新代码，Caddy 托管的管理后台需在 `frontend` 执行 `npm run build` 并刷新页面。原有 Worker 分支未修改，无需因本次格式恢复单独重启；如果另行修改 Worker 的环境配置，则需要重启 Worker 才能加载。
 
 ## 2. 云端服务契约
 
 使用部署时的最新稳定服务可以，但“最新版”不保证永远保持接口不变。每次部署记录实际版本，先核对 OpenAPI 再联调。客户端依赖由 uv.lock 与 package-lock.json 固定，不能直接用远程升级代替兼容性检查。
 
-### 2.1 MinerU
+### 2.1 MinerU（PDF 任务）
 
 适配 MinerU 4 自部署 V1 便捷任务接口：
 
@@ -63,6 +78,14 @@ MinIO endpoint 不带协议前缀，TLS 由 `MINIO_SECURE` 控制。提前创建
 Milvus 使用项目专用集合。首次写入创建 HNSW / COSINE 索引及 1024 维 schema，已有不兼容集合会报错，不删除重建。服务端应与项目锁定的 PyMilvus 兼容，升级时单独验证。
 
 Redis 建议开启 AOF 和持久化卷。不要与随意淘汰键的临时缓存混用，会话、队列、状态与提交登记都是业务数据。SSE 保留最近约 1000 条事件，连接时先发完整快照，页面不依赖历史事件重建状态。
+
+### 2.5 DeepSeek 图片摘要（PDF 任务）
+
+`describe_images` 按图片逐张串行调用 `integrations.clients.describe`，每次发送一张图片和最多 2000 字符的附近正文。请求使用 `DEEPSEEK_MODEL`，显式设置 `thinking: {"type": "disabled"}` 和 `max_tokens: 4096`，提示词仍要求 300 字以内的中文摘要。4096 是单次生成的 token 预算，不是整份 PDF 的预算，也不等于 4096 个汉字。
+
+若响应的 `finish_reason` 为 `length`，仍返回可重试错误 `VISION_TRUNCATED`，不保存不完整摘要。空正文或不符合预期的响应结构返回 `VISION_EMPTY`。日志只记录已知结束原因、输入/输出/思考 token 数量及安全错误码，不记录图片、上下文、摘要或密钥；缺失 token 统计显示 `None`，不能当作实际用量为 0。
+
+演示场景：16 张图片中前 2 张描述已保存，第 3 张被截断。修改请求参数并重启 Worker 后，在管理页面重试原任务；已保存的描述会复用，未完成的图片继续处理。保持原模型与分块参数不变时，此处请求参数调整不会改变当前任务的配置指纹，无需重新上传 PDF。若自行更换模型，需遵循配置指纹检查提示重新上传。
 
 ## 3. 管理员配置
 
@@ -128,8 +151,8 @@ Worker 通过全局租约保持单实例，每 10 秒续期，失去执行权时
 
 ## 7. 当前边界
 
-- 外部服务尚未部署，跨服务成功路径、恢复语义及实际返回仍需云端联调验收。
-- 默认单文件 20 MiB、PDF 200 页，单 Worker 顺序处理；图片也顺序识别。
+- 云端跨服务成功路径、恢复语义及实际返回需在部署环境联调验收。
+- 新上传仅限 `.md`，默认单文件 20 MiB，单 Worker 顺序处理；历史 PDF 校验默认 200 页，历史图片顺序识别。
 - MD 必须为 UTF-8，不抓取远程图片或读取服务器任意路径；页面给出图片未增强提示。
 - 保留标题树、正文行号、图片 ID 和 MinerU 原始结构 JSON；当前不猜测 PDF 页码，chunk 的 `page_numbers=null`。精确逐页引用需后续依据实际 MinerU 产物补充。
 - Markdown 表格拆分重复表头，极长行继续递归切分；代码拆分重复围栏，结构拆分写入元数据。图片摘要进入向量文本。

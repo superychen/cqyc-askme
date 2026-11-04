@@ -21,7 +21,7 @@ dependencies = [
 # 集成依赖先声明为可选项；骨架启动无需安装它们或连接外部服务。
 [project.optional-dependencies]
 rag = [
-    "langchain",
+    "langchain[mcp]==1.4.6",
     "langgraph",
     "langchain-deepseek",
     "pymilvus",

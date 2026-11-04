@@ -72,9 +72,15 @@ function select(task: Task) {
   stream.addEventListener('unavailable', () => { stream?.close(); stream = null; streamState.value = '实时连接已断开，使用状态查询' })
 }
 
+/** 选择或拖入的文件统一在此预检，成功后供 submit 上传；服务端仍负责最终校验。
+ * 输入为浏览器 File；通过时更新 file 并清零进度，失败时保留当前待上传文件。
+ * 演示数据：notes.MD、resume.PDF 可选；notes.txt、notes.pdf.exe 或空文件提示错误。
+ * 此处只校验后缀与大小；真实 PDF 内容、加密状态、页数和 MD 编码由 API 校验。
+ * 上传进行中忽略新选择，避免界面文件名与正在发送的请求内容不一致。
+ */
 function choose(candidate?: File) {
   if (!candidate || uploading.value) return
-  if (!/\.(pdf|md)$/i.test(candidate.name)) { ElMessage.warning('请选择 PDF 或 Markdown 文件'); return }
+  if (!/\.(md|pdf)$/i.test(candidate.name)) { ElMessage.warning('仅支持 PDF（.pdf）或 Markdown（.md）文件'); return }
   if (candidate.size === 0 || candidate.size > auth.uploadLimit) { ElMessage.warning(`文件不能为空，且不能超过 ${size(auth.uploadLimit)}`); return }
   file.value = candidate; uploadProgress.value = 0
 }
@@ -148,9 +154,9 @@ onUnmounted(() => { stream?.close(); if (poll) clearInterval(poll) })
         <div class="ingestion-grid">
           <section class="panel upload-panel"><div class="panel-title"><div><span class="section-number">01</span><h2>导入新文档</h2></div><span class="pill">PDF / MARKDOWN</span></div>
             <p class="panel-description">将简历、项目经历或技术资料添加到知识库。</p>
-            <input ref="fileInput" class="hidden-input" type="file" accept=".pdf,.md" @change="onFile">
+            <input ref="fileInput" class="hidden-input" type="file" accept=".md,.pdf" @change="onFile">
             <button class="drop-zone" :class="{ dragging, 'has-file': file }" :disabled="uploading" @click="fileInput?.click()" @dragover.prevent="dragging = true" @dragleave.prevent="dragging = false" @drop.prevent="onDrop">
-              <span class="upload-symbol"><el-icon><Document v-if="file" /><UploadFilled v-else /></el-icon></span><strong>{{ file ? file.name : '拖拽文件到这里，或点击上传' }}</strong><span>{{ file ? size(file.size) + ' · 已准备好导入' : `支持 PDF 和 Markdown，单个文件不超过 ${size(auth.uploadLimit)}` }}</span><span v-if="!file" class="choose-label">选择文档<el-icon><ArrowRight /></el-icon></span>
+              <span class="upload-symbol"><el-icon><Document v-if="file" /><UploadFilled v-else /></el-icon></span><strong>{{ file ? file.name : '拖拽文件到这里，或点击上传' }}</strong><span>{{ file ? size(file.size) + ' · 已准备好导入' : `支持 PDF 或 UTF-8 编码的 .md 文件，单个文件不超过 ${size(auth.uploadLimit)}` }}</span><span v-if="!file" class="choose-label">选择文档<el-icon><ArrowRight /></el-icon></span>
             </button>
             <div v-if="uploading" class="upload-byte-progress"><span>文件上传 {{ uploadProgress }}%<small>上传完成后开始后台处理</small></span><el-progress :percentage="uploadProgress" :show-text="false" /></div>
             <el-button class="start-button" type="primary" size="large" :disabled="!file" :loading="uploading" @click="submit">{{ uploading ? '正在上传文档' : '开始导入知识库' }}<el-icon v-if="!uploading"><ArrowRight /></el-icon></el-button>
